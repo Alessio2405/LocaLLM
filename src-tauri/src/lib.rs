@@ -4,12 +4,27 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Theme};
+
+#[cfg(target_os = "android")]
+use encoding_rs::UTF_8;
+#[cfg(target_os = "android")]
+use std::num::NonZeroU32;
+#[cfg(target_os = "android")]
+use llama_cpp_2::context::params::LlamaContextParams;
+#[cfg(target_os = "android")]
+use llama_cpp_2::llama_backend::LlamaBackend;
+#[cfg(target_os = "android")]
+use llama_cpp_2::llama_batch::LlamaBatch;
+#[cfg(target_os = "android")]
+use llama_cpp_2::model::{AddBos, LlamaModel, params::LlamaModelParams};
+#[cfg(target_os = "android")]
+use llama_cpp_2::sampling::LlamaSampler;
 
 const MODEL_DOWNLOAD_PROGRESS: &str = "model-download-progress";
 const MODEL_DOWNLOAD_COMPLETE: &str = "model-download-complete";
@@ -41,6 +56,53 @@ struct ChatMessage {
     created_at: String,
     streaming: Option<bool>,
     error: Option<String>,
+    attachments: Option<Vec<ChatAttachment>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatAttachment {
+    id: String,
+    name: String,
+    size: u64,
+    mime_type: String,
+    text_content: Option<String>,
+    preview_url: Option<String>,
+    kind: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    included: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatGenerationSettings {
+    model_id: String,
+    system_prompt: String,
+    temperature: f32,
+    top_p: f32,
+    max_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSession {
+    id: String,
+    title: String,
+    created_at: String,
+    updated_at: String,
+    messages: Vec<ChatMessage>,
+    settings: ChatGenerationSettings,
+    pinned: Option<bool>,
+    tags: Option<Vec<String>>,
+    title_locked: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatStore {
+    chats: Vec<ChatSession>,
+    active_chat_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +193,8 @@ enum ThemePreference {
 struct PersistedSettings {
     theme_preference: ThemePreference,
     selected_model_id: Option<String>,
+    default_model_id: Option<String>,
+    auto_load_last_model: bool,
 }
 
 impl Default for PersistedSettings {
@@ -138,13 +202,26 @@ impl Default for PersistedSettings {
         Self {
             theme_preference: ThemePreference::System,
             selected_model_id: None,
+            default_model_id: Some(preferred_default_model_id().into()),
+            auto_load_last_model: true,
         }
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppSettingsPayload {
+    theme_preference: ThemePreference,
+    selected_model_id: Option<String>,
+    default_model_id: Option<String>,
+    auto_load_last_model: bool,
+}
+
+#[derive(Clone)]
 struct LoadedModel {
-    local_path: PathBuf,
-    ollama_model_name: String,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    local_path: Option<PathBuf>,
+    ollama_model_name: Option<String>,
 }
 
 struct AppStateInner {
@@ -167,12 +244,20 @@ struct OllamaChatRequest<'a> {
     model: &'a str,
     stream: bool,
     messages: Vec<OllamaChatMessage<'a>>,
+    options: OllamaOptions,
 }
 
 #[derive(Debug, Serialize)]
 struct OllamaChatMessage<'a> {
     role: &'a str,
     content: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaOptions {
+    temperature: f32,
+    top_p: f32,
+    num_predict: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +270,14 @@ struct OllamaStreamChunk {
 #[derive(Debug, Deserialize)]
 struct OllamaChunkMessage {
     content: String,
+}
+
+fn preferred_default_model_id() -> &'static str {
+    if cfg!(target_os = "android") {
+        "lfm-2.5-vl-1.6b"
+    } else {
+        "qwen-3.5-4b-q4km"
+    }
 }
 
 fn seed_models() -> Vec<ModelInfo> {
@@ -258,8 +351,31 @@ fn settings_path(app: &AppHandle) -> anyhow::Result<PathBuf> {
     Ok(app_data_dir(app)?.join("settings.json"))
 }
 
+fn chats_path(app: &AppHandle) -> anyhow::Result<PathBuf> {
+    Ok(app_data_dir(app)?.join("chats.json"))
+}
+
 fn ensure_directories(app: &AppHandle) -> anyhow::Result<()> {
     std::fs::create_dir_all(model_dir(app)?)?;
+    Ok(())
+}
+
+fn load_chat_store_from_disk(app: &AppHandle) -> anyhow::Result<Option<ChatStore>> {
+    let path = chats_path(app)?;
+    match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            let store = serde_json::from_str(&raw).context("failed to parse chats.json")?;
+            Ok(Some(store))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn save_chat_store_to_disk(app: &AppHandle, store: &ChatStore) -> anyhow::Result<()> {
+    ensure_directories(app)?;
+    let path = chats_path(app)?;
+    std::fs::write(path, serde_json::to_vec_pretty(store)?)?;
     Ok(())
 }
 
@@ -293,7 +409,7 @@ fn inspect_model_states(app: &AppHandle) -> HashMap<String, ModelRuntimeState> {
             }
         };
 
-        let state = match std::fs::metadata(&path) {
+        let mut state = match std::fs::metadata(&path) {
             Ok(metadata) if metadata.len() > 0 => ModelRuntimeState {
                 status: ModelDownloadState::Downloaded,
                 progress: 100.0,
@@ -313,6 +429,19 @@ fn inspect_model_states(app: &AppHandle) -> HashMap<String, ModelRuntimeState> {
             Err(_) => default_model_runtime_state(&model),
         };
 
+        if matches!(state.status, ModelDownloadState::Remote)
+            && ollama_model_exists(&ollama_model_name(&model.id))
+        {
+            state = ModelRuntimeState {
+                status: ModelDownloadState::Downloaded,
+                progress: 100.0,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                error: None,
+                local_path: None,
+            };
+        }
+
         states.insert(model.id.clone(), state);
     }
 
@@ -326,7 +455,8 @@ impl AppState {
         let selected_model_id = settings
             .selected_model_id
             .clone()
-            .unwrap_or_else(|| "lfm-2.5-vl-1.6b".into());
+            .or_else(|| settings.default_model_id.clone())
+            .unwrap_or_else(|| preferred_default_model_id().into());
 
         Self {
             inner: Arc::new(Mutex::new(AppStateInner {
@@ -351,6 +481,15 @@ fn runtime_status(inner: &AppStateInner) -> RuntimeStatus {
         inference_ready: inner.loaded_model_id.is_some(),
         is_generating: inner.is_generating,
         model_states: inner.model_states.clone(),
+    }
+}
+
+fn app_settings_payload(inner: &AppStateInner) -> AppSettingsPayload {
+    AppSettingsPayload {
+        theme_preference: inner.settings.theme_preference.clone(),
+        selected_model_id: inner.settings.selected_model_id.clone(),
+        default_model_id: inner.settings.default_model_id.clone(),
+        auto_load_last_model: inner.settings.auto_load_last_model,
     }
 }
 
@@ -396,23 +535,83 @@ fn ollama_model_name(model_id: &str) -> String {
     format!("locallm-{}", model_id)
 }
 
+#[cfg(not(target_os = "android"))]
+fn run_ollama_command(args: &[&str]) -> anyhow::Result<std::process::Output> {
+    Command::new("ollama")
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("Failed to run 'ollama {}'", args.join(" ")))
+}
+
+#[cfg(target_os = "android")]
+fn run_ollama_command(args: &[&str]) -> anyhow::Result<std::process::Output> {
+    Err(anyhow!(format!(
+        "Ollama is not available on Android for command '{}'",
+        args.join(" ")
+    )))
+}
+
+#[cfg(not(target_os = "android"))]
+fn ollama_model_exists(model_name: &str) -> bool {
+    run_ollama_command(&["show", model_name])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "android")]
+fn ollama_model_exists(_: &str) -> bool {
+    false
+}
+
 fn import_model_into_ollama(model_id: &str, local_path: &Path, app: &AppHandle) -> anyhow::Result<String> {
     let model_name = ollama_model_name(model_id);
     let modelfile_path = app_data_dir(app)?.join(format!("Modelfile-{}.txt", model_id));
     let normalized_path = local_path.to_string_lossy().replace('\\', "/");
-    let modelfile = format!("FROM {}\n", normalized_path);
+    let modelfile = format!(
+        r#"FROM {normalized_path}
+
+TEMPLATE """{{{{- if .System }}}}System: {{{{ .System }}}}
+
+{{{{ end }}}}{{{{- range .Messages }}}}{{{{- if eq .Role "user" }}}}User: {{{{ .Content }}}}
+
+{{{{ else if eq .Role "assistant" }}}}Assistant: {{{{ .Content }}}}
+
+{{{{ end }}}}{{{{ end }}}}Assistant: """
+
+PARAMETER stop "User:"
+PARAMETER stop "System:"
+"#,
+    );
+    let should_rebuild = std::fs::read_to_string(&modelfile_path)
+        .map(|existing| existing != modelfile)
+        .unwrap_or(true)
+        || !ollama_model_exists(&model_name);
     std::fs::write(&modelfile_path, modelfile)?;
 
-    let status = Command::new("ollama")
-        .args(["create", &model_name, "-f"])
-        .arg(&modelfile_path)
-        .status()
-        .context("Failed to run 'ollama create'")?;
+    if !should_rebuild {
+        return Ok(model_name);
+    }
 
-    if !status.success() {
-        return Err(anyhow!(
-            "Ollama failed to import the GGUF model. Make sure Ollama is installed and running."
-        ));
+    let modelfile_string = modelfile_path.to_string_lossy().to_string();
+    let output = run_ollama_command(&["create", &model_name, "-f", &modelfile_string])?;
+    if !output.status.success() || !ollama_model_exists(&model_name) {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "unknown Ollama error".to_string()
+        };
+        return Err(anyhow!(format!(
+            "Ollama failed to import the GGUF model. {details}"
+        )));
     }
 
     Ok(model_name)
@@ -422,6 +621,7 @@ async fn stream_ollama_response(
     app: AppHandle,
     ollama_model_name: String,
     messages: Vec<ChatMessage>,
+    options: ChatGenerationSettings,
     request_id: String,
     message_id: String,
     cancel_flag: Arc<AtomicBool>,
@@ -431,12 +631,21 @@ async fn stream_ollama_response(
         stream: true,
         messages: messages
             .iter()
-            .filter(|message| message.role == "user" || message.role == "assistant")
+            .filter(|message| {
+                message.role == "user"
+                    || message.role == "assistant"
+                    || message.role == "system"
+            })
             .map(|message| OllamaChatMessage {
                 role: &message.role,
                 content: &message.content,
             })
             .collect(),
+        options: OllamaOptions {
+            temperature: options.temperature,
+            top_p: options.top_p,
+            num_predict: options.max_tokens,
+        },
     };
 
     let response = reqwest::Client::new()
@@ -504,6 +713,163 @@ async fn stream_ollama_response(
                 return Ok(());
             }
         }
+    }
+
+    let _ = app.emit(
+        CHAT_COMPLETE,
+        ChatCompleteEvent {
+            request_id,
+            message_id,
+        },
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn build_embedded_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages.iter().filter(|message| {
+        message.role == "system" || message.role == "user" || message.role == "assistant"
+    }) {
+        match message.role.as_str() {
+            "system" => {
+                prompt.push_str("System: ");
+                prompt.push_str(&message.content);
+                prompt.push_str("\n\n");
+            }
+            "user" => {
+                prompt.push_str("User: ");
+                prompt.push_str(&message.content);
+                prompt.push_str("\n\n");
+            }
+            "assistant" => {
+                prompt.push_str("Assistant: ");
+                prompt.push_str(&message.content);
+                prompt.push_str("\n\n");
+            }
+            _ => {}
+        }
+    }
+    prompt.push_str("Assistant: ");
+    prompt
+}
+
+#[cfg(target_os = "android")]
+fn embedded_sampler(seed: u32, temperature: f32, top_p: f32) -> LlamaSampler {
+    if temperature <= 0.0 {
+        LlamaSampler::chain_simple([LlamaSampler::greedy()])
+    } else {
+        LlamaSampler::chain_simple([
+            LlamaSampler::top_k(40),
+            LlamaSampler::top_p(top_p.clamp(0.05, 1.0), 1),
+            LlamaSampler::temp(temperature.max(0.1)),
+            LlamaSampler::dist(seed),
+        ])
+    }
+}
+
+#[cfg(target_os = "android")]
+fn stream_embedded_response(
+    app: AppHandle,
+    model_path: PathBuf,
+    messages: Vec<ChatMessage>,
+    options: ChatGenerationSettings,
+    request_id: String,
+    message_id: String,
+    cancel_flag: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let backend = LlamaBackend::init().context("Failed to initialize llama.cpp backend")?;
+    let model = LlamaModel::load_from_file(&backend, &model_path, &LlamaModelParams::default())
+        .with_context(|| format!("Failed to load model from {}", model_path.display()))?;
+
+    let prompt = build_embedded_prompt(&messages);
+    let prompt_tokens = model
+        .str_to_token(&prompt, AddBos::Always)
+        .context("Failed to tokenize prompt for embedded inference")?;
+
+    let context_window = (prompt_tokens.len() + options.max_tokens as usize + 128).clamp(1024, 8192);
+    let mut context_params = LlamaContextParams::default()
+        .with_n_ctx(Some(NonZeroU32::new(context_window as u32).unwrap()));
+
+    let n_threads = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get() as u32)
+        .unwrap_or(2);
+    context_params = context_params
+        .with_n_threads(n_threads)
+        .with_n_threads_batch(n_threads);
+
+    let mut ctx = model
+        .new_context(&backend, context_params)
+        .context("Failed to create llama.cpp context")?;
+
+    let mut batch = LlamaBatch::new(512, 1);
+    let last_prompt_index = prompt_tokens.len().saturating_sub(1);
+    for (index, token) in prompt_tokens.iter().enumerate() {
+        let is_last = index == last_prompt_index;
+        batch
+            .add(*token, index as i32, &[0], is_last)
+            .context("Failed to add prompt token to llama batch")?;
+    }
+
+    ctx.decode(&mut batch)
+        .context("Failed to decode embedded prompt")?;
+
+    let mut sampler = embedded_sampler(
+        (Utc::now().timestamp_millis() & 0xffff_ffff) as u32,
+        options.temperature,
+        options.top_p,
+    );
+    let mut decoder = UTF_8.new_decoder();
+    let mut current_token_index = prompt_tokens.len() as i32;
+    let max_token_index = current_token_index + options.max_tokens as i32;
+
+    while current_token_index < max_token_index {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = app.emit(
+                CHAT_COMPLETE,
+                ChatCompleteEvent {
+                    request_id,
+                    message_id,
+                },
+            );
+            return Ok(());
+        }
+
+        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        sampler.accept(token);
+
+        if model.is_eog_token(token) {
+            let _ = app.emit(
+                CHAT_COMPLETE,
+                ChatCompleteEvent {
+                    request_id,
+                    message_id,
+                },
+            );
+            return Ok(());
+        }
+
+        let piece = model
+            .token_to_piece(token, false, &mut decoder)
+            .context("Failed to decode embedded token piece")?;
+        if !piece.is_empty() {
+            let _ = app.emit(
+                CHAT_TOKEN,
+                ChatTokenEvent {
+                    request_id: request_id.clone(),
+                    message_id: message_id.clone(),
+                    token: piece,
+                },
+            );
+        }
+
+        batch.clear();
+        batch
+            .add(token, current_token_index, &[0], true)
+            .context("Failed to add generated token to llama batch")?;
+        current_token_index += 1;
+        ctx.decode(&mut batch)
+            .context("Failed to decode embedded token batch")?;
     }
 
     let _ = app.emit(
@@ -733,7 +1099,7 @@ fn cancel_model_download(model_id: String, state: State<'_, AppState>) -> Runtim
 }
 
 #[tauri::command]
-fn select_model(
+fn delete_model(
     app: AppHandle,
     model_id: String,
     state: State<'_, AppState>,
@@ -745,12 +1111,52 @@ fn select_model(
         .ok_or_else(|| "Unknown model".to_string())?;
     let local_path = model_file_path(&app, &model).map_err(|err| err.to_string())?;
 
+    if local_path.exists() {
+        std::fs::remove_file(&local_path).map_err(|err| err.to_string())?;
+    }
+
+    let _ = run_ollama_command(&["rm", &ollama_model_name(&model_id)]);
+
+    let mut inner = state.inner.lock().unwrap();
+    if inner.loaded_model_id.as_deref() == Some(&model_id) {
+        inner.loaded_model_id = None;
+        inner.loaded_model = None;
+    }
+    if inner.selected_model_id == model_id {
+        inner.selected_model_id = inner
+            .settings
+            .default_model_id
+            .clone()
+            .unwrap_or_else(|| preferred_default_model_id().into());
+        inner.settings.selected_model_id = Some(inner.selected_model_id.clone());
+        let _ = save_settings(&app, &inner.settings);
+    }
+    set_model_state(&mut inner, &model_id, default_model_runtime_state(&model));
+    Ok(runtime_status(&inner))
+}
+
+#[tauri::command]
+fn select_model(
+    app: AppHandle,
+    model_id: String,
+    state: State<'_, AppState>,
+) -> Result<RuntimeStatus, String> {
+    let models = model_index();
+    let model = models
+        .get(&model_id)
+        .cloned()
+        .ok_or_else(|| "Unknown model".to_string())?;
+    let local_path = model_file_path(&app, &model).map_err(|err| err.to_string())?;
+    let ollama_name = ollama_model_name(&model_id);
+    let has_local_file = local_path.exists();
+    let has_ollama_model = ollama_model_exists(&ollama_name);
+
     let mut inner = state.inner.lock().unwrap();
     inner.selected_model_id = model_id.clone();
     inner.settings.selected_model_id = Some(model_id.clone());
     let _ = save_settings(&app, &inner.settings);
 
-    if !local_path.exists() {
+    if !has_local_file && !has_ollama_model {
         inner.loaded_model_id = None;
         inner.loaded_model = None;
         let current = set_model_state(
@@ -785,24 +1191,37 @@ fn select_model(
             progress: 100.0,
             downloaded_bytes: std::fs::metadata(&local_path)
                 .map(|metadata| metadata.len())
-                .unwrap_or(model.size_bytes),
+                .unwrap_or(0),
             total_bytes: std::fs::metadata(&local_path)
                 .map(|metadata| metadata.len())
-                .unwrap_or(model.size_bytes),
+                .unwrap_or(0),
             error: None,
-            local_path: Some(local_path.to_string_lossy().to_string()),
+            local_path: has_local_file.then(|| local_path.to_string_lossy().to_string()),
         },
     );
     emit_download_event(&app, MODEL_DOWNLOAD_PROGRESS, &model_id, &loading_state);
     drop(inner);
 
-    let imported_name =
-        import_model_into_ollama(&model_id, &local_path, &app).map_err(|err| err.to_string())?;
+    #[cfg(target_os = "android")]
+    let imported_name: Option<String> = None;
+    #[cfg(target_os = "android")]
+    let loaded_model_path = Some(local_path.clone());
+
+    #[cfg(not(target_os = "android"))]
+    let imported_name = if has_ollama_model {
+        ollama_name
+    } else {
+        import_model_into_ollama(&model_id, &local_path, &app).map_err(|err| err.to_string())?
+    };
+    #[cfg(not(target_os = "android"))]
+    let imported_name = Some(imported_name);
+    #[cfg(not(target_os = "android"))]
+    let loaded_model_path = has_local_file.then(|| local_path.clone());
 
     let mut inner = state.inner.lock().unwrap();
     inner.loaded_model_id = Some(model_id.clone());
     inner.loaded_model = Some(LoadedModel {
-        local_path: local_path.clone(),
+        local_path: loaded_model_path,
         ollama_model_name: imported_name,
     });
     let ready_state = set_model_state(
@@ -813,12 +1232,12 @@ fn select_model(
             progress: 100.0,
             downloaded_bytes: std::fs::metadata(&local_path)
                 .map(|metadata| metadata.len())
-                .unwrap_or(model.size_bytes),
+                .unwrap_or(0),
             total_bytes: std::fs::metadata(&local_path)
                 .map(|metadata| metadata.len())
-                .unwrap_or(model.size_bytes),
+                .unwrap_or(0),
             error: None,
-            local_path: Some(local_path.to_string_lossy().to_string()),
+            local_path: has_local_file.then(|| local_path.to_string_lossy().to_string()),
         },
     );
     emit_download_event(&app, MODEL_DOWNLOAD_COMPLETE, &model_id, &ready_state);
@@ -830,9 +1249,10 @@ fn send_chat(
     app: AppHandle,
     model_id: String,
     messages: Vec<ChatMessage>,
+    options: ChatGenerationSettings,
     state: State<'_, AppState>,
 ) -> Result<GenerationStart, String> {
-    let (request_id, message_id, cancel_flag, ollama_name, state_handle) = {
+    let (request_id, message_id, cancel_flag, loaded_model, state_handle) = {
         let mut inner = state.inner.lock().unwrap();
         if inner.is_generating {
             return Err("A generation is already in progress".into());
@@ -844,8 +1264,7 @@ fn send_chat(
             .loaded_model
             .as_ref()
             .ok_or_else(|| "The selected model is not loaded".to_string())?;
-        let _ = loaded.local_path.as_os_str();
-        let ollama_name = loaded.ollama_model_name.clone();
+        let loaded_model = loaded.clone();
         let request_id = format!("req-{}", Utc::now().timestamp_millis());
         let message_id = format!("assistant-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -855,7 +1274,7 @@ fn send_chat(
             request_id,
             message_id,
             cancel_flag,
-            ollama_name,
+            loaded_model,
             state.inner.clone(),
         )
     };
@@ -864,11 +1283,51 @@ fn send_chat(
     let request_id_for_task = request_id.clone();
     let message_id_for_task = message_id.clone();
 
+    #[cfg(target_os = "android")]
+    let local_path = loaded_model
+        .local_path
+        .clone()
+        .ok_or_else(|| "The selected model has no local file available".to_string())?;
+    #[cfg(not(target_os = "android"))]
+    let ollama_name = loaded_model
+        .ollama_model_name
+        .clone()
+        .ok_or_else(|| "The selected model is not imported into Ollama".to_string())?;
+
+    #[cfg(target_os = "android")]
+    tokio::task::spawn_blocking(move || {
+        let result = stream_embedded_response(
+            app_handle.clone(),
+            local_path,
+            messages,
+            options,
+            request_id_for_task.clone(),
+            message_id_for_task.clone(),
+            cancel_flag,
+        );
+
+        let mut inner = state_handle.lock().unwrap();
+        inner.is_generating = false;
+        inner.generation_cancel = None;
+        if let Err(err) = result {
+            let _ = app_handle.emit(
+                CHAT_ERROR,
+                ChatErrorEvent {
+                    request_id: request_id_for_task,
+                    message_id: message_id_for_task,
+                    error: err.to_string(),
+                },
+            );
+        }
+    });
+
+    #[cfg(not(target_os = "android"))]
     tauri::async_runtime::spawn(async move {
         let result = stream_ollama_response(
             app_handle.clone(),
             ollama_name,
             messages,
+            options,
             request_id_for_task.clone(),
             message_id_for_task.clone(),
             cancel_flag,
@@ -906,6 +1365,16 @@ fn cancel_generation(state: State<'_, AppState>) -> RuntimeStatus {
 }
 
 #[tauri::command]
+fn load_chat_store(app: AppHandle) -> Result<Option<ChatStore>, String> {
+    load_chat_store_from_disk(&app).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn save_chat_store(app: AppHandle, store: ChatStore) -> Result<(), String> {
+    save_chat_store_to_disk(&app, &store).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn get_theme_preference(state: State<'_, AppState>) -> ThemePreference {
     let inner = state.inner.lock().unwrap();
     inner.settings.theme_preference.clone()
@@ -927,12 +1396,101 @@ fn set_theme_preference(
     Ok(preference)
 }
 
+#[tauri::command]
+fn get_app_settings(state: State<'_, AppState>) -> AppSettingsPayload {
+    let inner = state.inner.lock().unwrap();
+    app_settings_payload(&inner)
+}
+
+#[tauri::command]
+fn update_app_settings(
+    app: AppHandle,
+    settings: AppSettingsPayload,
+    state: State<'_, AppState>,
+) -> Result<AppSettingsPayload, String> {
+    let payload = {
+        let mut inner = state.inner.lock().unwrap();
+        inner.settings.theme_preference = settings.theme_preference;
+        inner.settings.selected_model_id = settings.selected_model_id;
+        inner.settings.default_model_id = settings.default_model_id;
+        inner.settings.auto_load_last_model = settings.auto_load_last_model;
+
+        if let Some(selected) = inner.settings.selected_model_id.clone() {
+            inner.selected_model_id = selected;
+        } else if let Some(default_model_id) = inner.settings.default_model_id.clone() {
+            inner.selected_model_id = default_model_id;
+        }
+
+        save_settings(&app, &inner.settings).map_err(|err| err.to_string())?;
+        app_settings_payload(&inner)
+    };
+    apply_theme_to_window(&app, &payload.theme_preference);
+    Ok(payload)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             ensure_directories(app.handle())
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
             let state = AppState::new(app.handle());
+            if state.inner.lock().unwrap().settings.auto_load_last_model {
+                let selected_model_id = state.inner.lock().unwrap().selected_model_id.clone();
+                let models = model_index();
+                if let Some(model) = models.get(&selected_model_id) {
+                    if let Ok(local_path) = model_file_path(app.handle(), model) {
+                        let has_local_file = local_path.exists();
+                        #[cfg(target_os = "android")]
+                        let loaded_model = has_local_file.then(|| LoadedModel {
+                            local_path: Some(local_path.clone()),
+                            ollama_model_name: None,
+                        });
+
+                        #[cfg(not(target_os = "android"))]
+                        let loaded_model = {
+                            let imported_name = if has_local_file {
+                                import_model_into_ollama(
+                                    &selected_model_id,
+                                    &local_path,
+                                    app.handle(),
+                                )
+                                .ok()
+                            } else {
+                                let ollama_name = ollama_model_name(&selected_model_id);
+                                ollama_model_exists(&ollama_name).then_some(ollama_name)
+                            };
+
+                            imported_name.map(|imported_name| LoadedModel {
+                                local_path: has_local_file.then(|| local_path.clone()),
+                                ollama_model_name: Some(imported_name),
+                            })
+                        };
+
+                        if let Some(loaded_model) = loaded_model {
+                            let mut inner = state.inner.lock().unwrap();
+                            inner.loaded_model_id = Some(selected_model_id.clone());
+                            inner.loaded_model = Some(loaded_model);
+                            set_model_state(
+                                &mut inner,
+                                &selected_model_id,
+                                ModelRuntimeState {
+                                    status: ModelDownloadState::Ready,
+                                    progress: 100.0,
+                                    downloaded_bytes: std::fs::metadata(&local_path)
+                                        .map(|metadata| metadata.len())
+                                        .unwrap_or(0),
+                                    total_bytes: std::fs::metadata(&local_path)
+                                        .map(|metadata| metadata.len())
+                                        .unwrap_or(0),
+                                    error: None,
+                                    local_path: has_local_file
+                                        .then(|| local_path.to_string_lossy().to_string()),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             apply_theme_to_window(
                 app.handle(),
                 &state.inner.lock().unwrap().settings.theme_preference,
@@ -945,11 +1503,16 @@ pub fn run() {
             get_runtime_status,
             download_model,
             cancel_model_download,
+            delete_model,
             select_model,
             send_chat,
             cancel_generation,
+            load_chat_store,
+            save_chat_store,
             get_theme_preference,
-            set_theme_preference
+            set_theme_preference,
+            get_app_settings,
+            update_app_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

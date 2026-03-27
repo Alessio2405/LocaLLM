@@ -36,4 +36,25 @@ export const HIGH_RAM_MAC_MODEL: ModelInfo = {
   sizeHuman: "3.63 GB",
 };
 
+export const MOBILE_DEFAULT_MODEL_ID = DEFAULT_MODEL.id;
+export const DESKTOP_DEFAULT_MODEL_ID = HIGH_RAM_MAC_MODEL.id;
+export const BALANCED_DEFAULT_MODEL_ID = TAURI_DEFAULT_MODEL.id;
+
+export function getPreferredModelId(platform?: string) {
+  return platform === "android" ? MOBILE_DEFAULT_MODEL_ID : DESKTOP_DEFAULT_MODEL_ID;
+}
+
+export function getModelRecommendation(modelId: string, platform?: string) {
+  if (modelId === getPreferredModelId(platform)) {
+    return platform === "android" ? "Recommended for mobile" : "Recommended";
+  }
+  if (modelId === BALANCED_DEFAULT_MODEL_ID) {
+    return "Balanced";
+  }
+  if (modelId === MOBILE_DEFAULT_MODEL_ID) {
+    return "Fastest";
+  }
+  return "Higher quality";
+}
+
 export const MODELS = [DEFAULT_MODEL, TAURI_DEFAULT_MODEL, HIGH_RAM_MAC_MODEL];

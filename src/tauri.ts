@@ -2,9 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { MODELS } from "./models";
 import type {
+  AppSettings,
   ChatCompleteEvent,
   ChatErrorEvent,
   ChatMessage,
+  ChatStore,
+  ChatGenerationSettings,
   ChatTokenEvent,
   DownloadProgressEvent,
   GenerationStart,
@@ -82,6 +85,7 @@ export async function cancelModelDownload(modelId: string): Promise<RuntimeStatu
 export async function sendChat(
   modelId: string,
   messages: ChatMessage[],
+  options: ChatGenerationSettings,
 ): Promise<GenerationStart> {
   if (!isTauri()) {
     return {
@@ -90,7 +94,7 @@ export async function sendChat(
     };
   }
 
-  return invoke<GenerationStart>("send_chat", { modelId, messages });
+  return invoke<GenerationStart>("send_chat", { modelId, messages, options });
 }
 
 export async function cancelGeneration(): Promise<RuntimeStatus> {
@@ -117,6 +121,53 @@ export async function setThemePreference(
   }
 
   return invoke<ThemePreference>("set_theme_preference", { theme });
+}
+
+export async function loadChatStore(): Promise<ChatStore | null> {
+  if (!isTauri()) {
+    return null;
+  }
+
+  return invoke<ChatStore | null>("load_chat_store");
+}
+
+export async function saveChatStore(store: ChatStore): Promise<void> {
+  if (!isTauri()) {
+    return;
+  }
+
+  await invoke("save_chat_store", { store });
+}
+
+export async function getAppSettings(): Promise<AppSettings> {
+  if (!isTauri()) {
+    return {
+      themePreference: "system",
+      selectedModelId: MODELS[0].id,
+      defaultModelId: MODELS[0].id,
+      autoLoadLastModel: true,
+    };
+  }
+
+  return invoke<AppSettings>("get_app_settings");
+}
+
+export async function updateAppSettings(
+  settings: AppSettings,
+): Promise<AppSettings> {
+  if (!isTauri()) {
+    return settings;
+  }
+
+  return invoke<AppSettings>("update_app_settings", { settings });
+}
+
+export async function deleteModel(modelId: string): Promise<RuntimeStatus> {
+  if (!isTauri()) {
+    return previewState();
+  }
+
+  return invoke<RuntimeStatus>("delete_model", { modelId });
 }
 
 export async function onDownloadProgress(

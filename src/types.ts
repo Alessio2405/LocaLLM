@@ -38,6 +38,52 @@ export type ChatMessage = {
   createdAt: string;
   streaming?: boolean;
   error?: string | null;
+  attachments?: ChatAttachment[];
+};
+
+export type ChatAttachment = {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  textContent?: string | null;
+  previewUrl?: string | null;
+  kind?: "text" | "pdf" | "docx" | "image" | "binary";
+  width?: number | null;
+  height?: number | null;
+  included?: boolean;
+};
+
+export type ChatGenerationSettings = {
+  modelId: string;
+  systemPrompt: string;
+  temperature: number;
+  topP: number;
+  maxTokens: number;
+};
+
+export type ChatSession = {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messages: ChatMessage[];
+  settings: ChatGenerationSettings;
+  pinned?: boolean;
+  tags?: string[];
+  titleLocked?: boolean;
+};
+
+export type ChatStore = {
+  chats: ChatSession[];
+  activeChatId: string;
+};
+
+export type AppSettings = {
+  themePreference: ThemePreference;
+  selectedModelId?: string | null;
+  defaultModelId?: string | null;
+  autoLoadLastModel: boolean;
 };
 
 export type RuntimeStatus = {
