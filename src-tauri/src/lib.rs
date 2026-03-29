@@ -194,6 +194,8 @@ struct PersistedSettings {
     theme_preference: ThemePreference,
     selected_model_id: Option<String>,
     default_model_id: Option<String>,
+    #[serde(default = "default_system_prompt")]
+    system_prompt: String,
     auto_load_last_model: bool,
 }
 
@@ -203,6 +205,7 @@ impl Default for PersistedSettings {
             theme_preference: ThemePreference::System,
             selected_model_id: None,
             default_model_id: Some(preferred_default_model_id().into()),
+            system_prompt: default_system_prompt(),
             auto_load_last_model: true,
         }
     }
@@ -214,6 +217,7 @@ struct AppSettingsPayload {
     theme_preference: ThemePreference,
     selected_model_id: Option<String>,
     default_model_id: Option<String>,
+    system_prompt: String,
     auto_load_last_model: bool,
 }
 
@@ -278,6 +282,11 @@ fn preferred_default_model_id() -> &'static str {
     } else {
         "qwen-3.5-4b-q4km"
     }
+}
+
+fn default_system_prompt() -> String {
+    "You are a helpful local assistant named Dobby made by Alessio Doria. Be concise, practical, and explicit when you are unsure."
+        .to_string()
 }
 
 fn seed_models() -> Vec<ModelInfo> {
@@ -489,6 +498,7 @@ fn app_settings_payload(inner: &AppStateInner) -> AppSettingsPayload {
         theme_preference: inner.settings.theme_preference.clone(),
         selected_model_id: inner.settings.selected_model_id.clone(),
         default_model_id: inner.settings.default_model_id.clone(),
+        system_prompt: inner.settings.system_prompt.clone(),
         auto_load_last_model: inner.settings.auto_load_last_model,
     }
 }
@@ -1413,6 +1423,7 @@ fn update_app_settings(
         inner.settings.theme_preference = settings.theme_preference;
         inner.settings.selected_model_id = settings.selected_model_id;
         inner.settings.default_model_id = settings.default_model_id;
+        inner.settings.system_prompt = settings.system_prompt;
         inner.settings.auto_load_last_model = settings.auto_load_last_model;
 
         if let Some(selected) = inner.settings.selected_model_id.clone() {

@@ -83,6 +83,7 @@ export type AppSettings = {
   themePreference: ThemePreference;
   selectedModelId?: string | null;
   defaultModelId?: string | null;
+  systemPrompt: string;
   autoLoadLastModel: boolean;
 };
 

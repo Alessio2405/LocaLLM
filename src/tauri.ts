@@ -18,6 +18,8 @@ import type {
 
 const isTauri = () =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const DEFAULT_SYSTEM_PROMPT =
+  "You are a helpful local assistant named Dobby made by Alessio Doria. Be concise, practical, and explicit when you are unsure.";
 
 function previewState(modelId = MODELS[0].id): RuntimeStatus {
   return {
@@ -145,6 +147,7 @@ export async function getAppSettings(): Promise<AppSettings> {
       themePreference: "system",
       selectedModelId: MODELS[0].id,
       defaultModelId: MODELS[0].id,
+      systemPrompt: DEFAULT_SYSTEM_PROMPT,
       autoLoadLastModel: true,
     };
   }

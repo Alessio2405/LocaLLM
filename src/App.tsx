@@ -1,5 +1,9 @@
 import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
-import { MessageContent, getAssistantMessagePreview } from "./messageContent";
+import {
+  MessageContent,
+  getAssistantMessagePreview,
+  stripAssistantInternalContent,
+} from "./messageContent";
 import {
   MODELS,
   getModelRecommendation,
@@ -42,6 +46,8 @@ import type {
 const CHAT_STORAGE_KEY = "locallm.chat-sessions";
 const ACTIVE_CHAT_STORAGE_KEY = "locallm.active-chat";
 const INITIAL_DEFAULT_MODEL_ID = getPreferredModelId();
+const DEFAULT_SYSTEM_PROMPT =
+  "You are a helpful local assistant named Dobby made by Alessio Doria. Be concise, practical, and explicit when you are unsure.";
 
 const getSystemTheme = (): EffectiveTheme =>
   typeof window !== "undefined" &&
@@ -49,10 +55,12 @@ const getSystemTheme = (): EffectiveTheme =>
     ? "light"
     : "dark";
 
-const defaultGenerationSettings = (modelId: string): ChatGenerationSettings => ({
+const defaultGenerationSettings = (
+  modelId: string,
+  systemPrompt = DEFAULT_SYSTEM_PROMPT,
+): ChatGenerationSettings => ({
   modelId,
-  systemPrompt:
-    "You are a helpful local assistant. Be concise, practical, and explicit when you are unsure.",
+  systemPrompt,
   temperature: 0.7,
   topP: 0.9,
   maxTokens: 1024,
@@ -66,7 +74,7 @@ const createWelcomeMessage = (): ChatMessage => ({
   createdAt: new Date().toISOString(),
 });
 
-const createChatSession = (modelId: string): ChatSession => {
+const createChatSession = (modelId: string, systemPrompt = DEFAULT_SYSTEM_PROMPT): ChatSession => {
   const now = new Date().toISOString();
   return {
     id: crypto.randomUUID(),
@@ -74,32 +82,37 @@ const createChatSession = (modelId: string): ChatSession => {
     createdAt: now,
     updatedAt: now,
     messages: [createWelcomeMessage()],
-    settings: defaultGenerationSettings(modelId),
+    settings: defaultGenerationSettings(modelId, systemPrompt),
     pinned: false,
     tags: [],
     titleLocked: false,
   };
 };
 
-const createFallbackStore = (modelId: string): ChatStore => {
-  const chat = createChatSession(modelId);
+const createFallbackStore = (modelId: string, systemPrompt = DEFAULT_SYSTEM_PROMPT): ChatStore => {
+  const chat = createChatSession(modelId, systemPrompt);
   return { chats: [chat], activeChatId: chat.id };
 };
 
-function loadBrowserStore(modelId: string): ChatStore {
+function loadBrowserStore(modelId: string, systemPrompt = DEFAULT_SYSTEM_PROMPT): ChatStore {
   if (typeof window === "undefined") {
-    return createFallbackStore(modelId);
+    return createFallbackStore(modelId, systemPrompt);
   }
 
   try {
     const chats = JSON.parse(window.localStorage.getItem(CHAT_STORAGE_KEY) || "null");
     const activeChatId = window.localStorage.getItem(ACTIVE_CHAT_STORAGE_KEY);
     if (!Array.isArray(chats) || !chats.length) {
-      return createFallbackStore(modelId);
+      return createFallbackStore(modelId, systemPrompt);
     }
     const normalized = chats.map((chat: ChatSession) => ({
       ...chat,
-      settings: { ...defaultGenerationSettings(modelId), ...chat.settings },
+      settings: {
+        ...defaultGenerationSettings(modelId, systemPrompt),
+        ...chat.settings,
+        modelId,
+        systemPrompt,
+      },
       pinned: Boolean(chat.pinned),
       tags: normalizeTags(chat.tags || []),
       titleLocked: Boolean(chat.titleLocked),
@@ -112,7 +125,7 @@ function loadBrowserStore(modelId: string): ChatStore {
           : normalized[0].id,
     };
   } catch {
-    return createFallbackStore(modelId);
+    return createFallbackStore(modelId, systemPrompt);
   }
 }
 
@@ -158,6 +171,55 @@ const defaultModelState = (totalBytes = 0): ModelRuntimeState => ({
   error: null,
   localPath: null,
 });
+
+const isUsableModelState = (state?: ModelRuntimeState | null) =>
+  state?.status === "downloaded" || state?.status === "ready";
+
+const resolveModelId = (
+  availableModels: ModelInfo[],
+  modelStates: RuntimeStatus["modelStates"],
+  platform: string,
+  ...preferredIds: Array<string | null | undefined>
+) => {
+  const candidates = [
+    ...new Set(
+      [...preferredIds, getPreferredModelId(platform), availableModels[0]?.id].filter(
+        (value): value is string => Boolean(value),
+      ),
+    ),
+  ];
+
+  const usableCandidate = candidates.find((modelId) => isUsableModelState(modelStates[modelId]));
+  if (usableCandidate) {
+    return usableCandidate;
+  }
+
+  return availableModels.find((model) => isUsableModelState(modelStates[model.id]))?.id ?? candidates[0];
+};
+
+const getErrorMessage = (error: unknown, fallback: string) => {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+  if (error && typeof error === "object") {
+    const message = Reflect.get(error, "message");
+    if (typeof message === "string" && message.trim()) {
+      return message;
+    }
+    try {
+      const serialized = JSON.stringify(error);
+      if (serialized && serialized !== "{}") {
+        return serialized;
+      }
+    } catch {
+      // Ignore serialization failures and fall back to the default message.
+    }
+  }
+  return fallback;
+};
 
 const formatBytes = (value: number) =>
   value >= 1_000_000_000
@@ -399,6 +461,28 @@ function normalizeUserMessageContent(content: string) {
     .replace(/\u00a0/g, " ");
 }
 
+function sanitizeChatMessages(messages: ChatMessage[]) {
+  return messages.map((message) =>
+    message.role === "assistant"
+      ? { ...message, content: stripAssistantInternalContent(message.content) }
+      : message,
+  );
+}
+
+function applySharedChatSettings(
+  chats: ChatSession[],
+  sharedSettings: Pick<ChatGenerationSettings, "modelId" | "systemPrompt">,
+) {
+  return chats.map((chat) => ({
+    ...chat,
+    settings: {
+      ...chat.settings,
+      modelId: sharedSettings.modelId,
+      systemPrompt: sharedSettings.systemPrompt,
+    },
+  }));
+}
+
 function getAttachmentMetaLabel(attachment: ChatAttachment) {
   const details = [attachment.kind ?? "file", formatBytes(attachment.size)];
   if (attachment.kind === "image" && attachment.width && attachment.height) {
@@ -465,9 +549,12 @@ function App() {
     themePreference: "system",
     selectedModelId: INITIAL_DEFAULT_MODEL_ID,
     defaultModelId: INITIAL_DEFAULT_MODEL_ID,
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
     autoLoadLastModel: true,
   });
-  const [chatSessions, setChatSessions] = useState<ChatSession[]>([createChatSession(INITIAL_DEFAULT_MODEL_ID)]);
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([
+    createChatSession(INITIAL_DEFAULT_MODEL_ID, DEFAULT_SYSTEM_PROMPT),
+  ]);
   const [activeChatId, setActiveChatId] = useState(chatSessions[0].id);
   const [draft, setDraft] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([]);
@@ -484,7 +571,12 @@ function App() {
   const messageEndRef = useRef<HTMLDivElement | null>(null);
 
   const activeChat = chatSessions.find((chat) => chat.id === activeChatId) ?? chatSessions[0];
-  const activeSettings = activeChat?.settings ?? defaultGenerationSettings(INITIAL_DEFAULT_MODEL_ID);
+  const activeSettings =
+    activeChat?.settings ??
+    defaultGenerationSettings(
+      appSettings.selectedModelId || appSettings.defaultModelId || INITIAL_DEFAULT_MODEL_ID,
+      appSettings.systemPrompt,
+    );
   const selectedModel = models.find((model) => model.id === activeSettings.modelId) ?? models[0];
   const selectedModelState =
     runtime.modelStates[activeSettings.modelId] ?? defaultModelState(selectedModel?.sizeBytes || 0);
@@ -542,23 +634,59 @@ function App() {
         ]);
         if (cancelled) return;
 
+        const resolvedSelectedModelId = resolveModelId(
+          availableModels,
+          runtimeStatus.modelStates,
+          runtimeStatus.platform,
+          persistedSettings.selectedModelId,
+          persistedSettings.defaultModelId,
+        );
+        const resolvedSystemPrompt = persistedSettings.systemPrompt || DEFAULT_SYSTEM_PROMPT;
+        const nextSettings =
+          resolvedSelectedModelId !== persistedSettings.selectedModelId
+            || resolvedSystemPrompt !== persistedSettings.systemPrompt
+            ? await updateAppSettings({
+                ...persistedSettings,
+                selectedModelId: resolvedSelectedModelId,
+                systemPrompt: resolvedSystemPrompt,
+              })
+            : persistedSettings;
+        if (cancelled) return;
+
         setModels(availableModels);
         setRuntime(runtimeStatus);
-        setAppSettings(persistedSettings);
+        setAppSettings(nextSettings);
 
-        const fallbackModelId =
-          persistedSettings.selectedModelId ||
-          persistedSettings.defaultModelId ||
-          availableModels[0]?.id ||
-          getPreferredModelId(runtimeStatus.platform);
-        const store = persistedStore || loadBrowserStore(fallbackModelId);
-        const chats = sortChats((store.chats.length ? store.chats : [createChatSession(fallbackModelId)]).map((chat) => ({
-          ...chat,
-          settings: { ...defaultGenerationSettings(fallbackModelId), ...chat.settings },
-          pinned: Boolean(chat.pinned),
-          tags: normalizeTags(chat.tags || []),
-          titleLocked: Boolean(chat.titleLocked),
-        })));
+        const fallbackModelId = resolveModelId(
+          availableModels,
+          runtimeStatus.modelStates,
+          runtimeStatus.platform,
+          nextSettings.selectedModelId,
+          nextSettings.defaultModelId,
+        );
+        const store = persistedStore || loadBrowserStore(fallbackModelId, nextSettings.systemPrompt);
+        const chats = sortChats((store.chats.length ? store.chats : [createChatSession(fallbackModelId, nextSettings.systemPrompt)]).map((chat) => {
+          const chatModelId = resolveModelId(
+            availableModels,
+            runtimeStatus.modelStates,
+            runtimeStatus.platform,
+            nextSettings.selectedModelId,
+            nextSettings.defaultModelId,
+          );
+          return {
+            ...chat,
+            messages: sanitizeChatMessages(chat.messages),
+            settings: {
+              ...defaultGenerationSettings(chatModelId, nextSettings.systemPrompt),
+              ...chat.settings,
+              modelId: chatModelId,
+              systemPrompt: nextSettings.systemPrompt,
+            },
+            pinned: Boolean(chat.pinned),
+            tags: normalizeTags(chat.tags || []),
+            titleLocked: Boolean(chat.titleLocked),
+          };
+        }));
         setChatSessions(chats);
         setActiveChatId(chats.some((chat) => chat.id === store.activeChatId) ? store.activeChatId : chats[0].id);
 
@@ -611,7 +739,13 @@ function App() {
               current.map((chat) => ({
                 ...chat,
                 messages: chat.messages.map((message) =>
-                  message.id === messageId ? { ...message, content: message.content + token, streaming: true } : message,
+                  message.id === messageId
+                    ? {
+                        ...message,
+                        content: stripAssistantInternalContent(message.content + token),
+                        streaming: true,
+                      }
+                    : message,
                 ),
               })),
             ),
@@ -742,16 +876,26 @@ function App() {
   };
 
   async function handleSelectModel(modelId: string) {
+    setChatSessions((current) => applySharedChatSettings(current, { modelId, systemPrompt: appSettings.systemPrompt }));
     setRuntime(await selectModel(modelId));
     await persistAppSettings({ ...appSettings, selectedModelId: modelId });
   }
 
   const handleDownload = async (modelId: string) => setRuntime(await downloadModel(modelId));
 
-  async function handleSetChatModel(modelId: string) {
-    updateActiveChat((chat) => ({ ...chat, updatedAt: new Date().toISOString(), settings: { ...chat.settings, modelId } }));
-    await handleSelectModel(modelId);
-  }
+  const handleSharedSystemPromptChange = (systemPrompt: string) => {
+    setAppSettings((current) => ({ ...current, systemPrompt }));
+    setChatSessions((current) =>
+      applySharedChatSettings(current, {
+        modelId: appSettings.selectedModelId || appSettings.defaultModelId || models[0]?.id || INITIAL_DEFAULT_MODEL_ID,
+        systemPrompt,
+      }),
+    );
+  };
+
+  const handleSharedSystemPromptBlur = async () => {
+    await persistAppSettings({ ...appSettings, systemPrompt: appSettings.systemPrompt });
+  };
 
   async function runGeneration(chatId: string, visibleMessages: ChatMessage[], settings: ChatGenerationSettings) {
     if (runtime.loadedModelId !== settings.modelId) {
@@ -799,7 +943,7 @@ function App() {
     try {
       await runGeneration(activeChat.id, visibleMessages, activeChat.settings);
     } catch (error) {
-      appendAssistantError(activeChat.id, error instanceof Error ? error.message : "Unable to start generation.");
+      appendAssistantError(activeChat.id, getErrorMessage(error, "Unable to start generation."));
       void refreshRuntime();
     }
   }
@@ -818,7 +962,7 @@ function App() {
       appSettings.defaultModelId ||
       models[0]?.id ||
       getPreferredModelId(runtime.platform);
-    const chat = createChatSession(modelId);
+    const chat = createChatSession(modelId, appSettings.systemPrompt);
     setChatSessions((current) => [chat, ...current]);
     setActiveChatId(chat.id);
     setDraft("");
@@ -831,7 +975,11 @@ function App() {
     setChatSessions((current) => {
       if (current.length === 1) {
         const replacement = createChatSession(
-          appSettings.defaultModelId || models[0]?.id || getPreferredModelId(runtime.platform),
+          appSettings.selectedModelId ||
+            appSettings.defaultModelId ||
+            models[0]?.id ||
+            getPreferredModelId(runtime.platform),
+          appSettings.systemPrompt,
         );
         setActiveChatId(replacement.id);
         return [replacement];
@@ -881,7 +1029,7 @@ function App() {
     try {
       await runGeneration(activeChat.id, trimmedMessages, activeChat.settings);
     } catch (error) {
-      appendAssistantError(activeChat.id, error instanceof Error ? error.message : "Unable to regenerate.");
+      appendAssistantError(activeChat.id, getErrorMessage(error, "Unable to regenerate."));
       void refreshRuntime();
     }
   };
@@ -932,9 +1080,9 @@ function App() {
       <aside className={`settings-panel${isSettingsOpen ? " open" : ""}`}>
         <div className="settings-header"><div><div className="panel-label">Settings</div><h3>Configuration</h3></div><button className="icon-button" type="button" onClick={() => setIsSettingsOpen(false)}>Close</button></div>
         <section className="panel settings-section"><div className="settings-row"><div><strong>Appearance</strong><p>Switch between system, light, and dark mode.</p></div><select aria-label="Theme preference" className="theme-select" value={appSettings.themePreference} onChange={(event) => void persistAppSettings({ ...appSettings, themePreference: event.target.value as ThemePreference })}><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></div><div className="toggle-row"><div><strong>Auto-load last model</strong><p>Best effort load at startup if already downloaded.</p></div><button className="toggle-button" type="button" onClick={() => void persistAppSettings({ ...appSettings, autoLoadLastModel: !appSettings.autoLoadLastModel })}>{appSettings.autoLoadLastModel ? "On" : "Off"}</button></div><div className="settings-stack"><label className="field"><span>Default model</span><select className="theme-select" value={appSettings.defaultModelId ?? models[0]?.id ?? ""} onChange={(event) => void persistAppSettings({ ...appSettings, defaultModelId: event.target.value })}>{models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label></div></section>
-        <section className="panel settings-section"><div className="panel-label">Current chat</div><div className="settings-stack"><label className="field"><span>Model</span><select className="theme-select" value={activeSettings.modelId} onChange={(event) => void handleSetChatModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label><label className="field"><span>Tags</span><div className="tag-editor"><input className="number-input" value={tagDraft} placeholder="Add a tag and press Enter" onChange={(event) => setTagDraft(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => { if (event.key === "Enter") { event.preventDefault(); addTagToActiveChat(); } }} /><button className="toggle-button" type="button" onClick={addTagToActiveChat}>Add</button></div>{activeChat?.tags?.length ? <div className="tag-row">{activeChat.tags.map((tag) => <button key={tag} className="tag-chip removable" type="button" onClick={() => removeTagFromActiveChat(tag)}>#{tag}</button>)}</div> : null}</label><label className="field"><span>System prompt</span><textarea className="settings-textarea" rows={4} value={activeSettings.systemPrompt} onChange={(event) => updateActiveChat((chat) => ({ ...chat, updatedAt: new Date().toISOString(), settings: { ...chat.settings, systemPrompt: event.target.value } }))} /></label><div className="field-grid"><label className="field"><span>Temperature</span><input type="range" min="0" max="2" step="0.1" value={activeSettings.temperature} onChange={(event) => updateActiveChat((chat) => ({ ...chat, settings: { ...chat.settings, temperature: Number(event.target.value) } }))} /><small>{activeSettings.temperature.toFixed(1)}</small></label><label className="field"><span>Top P</span><input type="range" min="0.1" max="1" step="0.05" value={activeSettings.topP} onChange={(event) => updateActiveChat((chat) => ({ ...chat, settings: { ...chat.settings, topP: Number(event.target.value) } }))} /><small>{activeSettings.topP.toFixed(2)}</small></label></div><label className="field"><span>Max tokens</span><input className="number-input" type="number" min="64" max="4096" step="64" value={activeSettings.maxTokens} onChange={(event) => updateActiveChat((chat) => ({ ...chat, settings: { ...chat.settings, maxTokens: Number(event.target.value) } }))} /></label></div></section>
+        <section className="panel settings-section"><div className="panel-label">Current chat</div><div className="settings-stack"><label className="field"><span>Model (shared across chats)</span><select className="theme-select" value={activeSettings.modelId} onChange={(event) => void handleSelectModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label><label className="field"><span>Tags</span><div className="tag-editor"><input className="number-input" value={tagDraft} placeholder="Add a tag and press Enter" onChange={(event) => setTagDraft(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => { if (event.key === "Enter") { event.preventDefault(); addTagToActiveChat(); } }} /><button className="toggle-button" type="button" onClick={addTagToActiveChat}>Add</button></div>{activeChat?.tags?.length ? <div className="tag-row">{activeChat.tags.map((tag) => <button key={tag} className="tag-chip removable" type="button" onClick={() => removeTagFromActiveChat(tag)}>#{tag}</button>)}</div> : null}</label><label className="field"><span>System prompt (shared across chats)</span><textarea className="settings-textarea" rows={4} value={activeSettings.systemPrompt} onChange={(event) => handleSharedSystemPromptChange(event.target.value)} onBlur={() => void handleSharedSystemPromptBlur()} /></label><div className="field-grid"><label className="field"><span>Temperature</span><input type="range" min="0" max="2" step="0.1" value={activeSettings.temperature} onChange={(event) => updateActiveChat((chat) => ({ ...chat, settings: { ...chat.settings, temperature: Number(event.target.value) } }))} /><small>{activeSettings.temperature.toFixed(1)}</small></label><label className="field"><span>Top P</span><input type="range" min="0.1" max="1" step="0.05" value={activeSettings.topP} onChange={(event) => updateActiveChat((chat) => ({ ...chat, settings: { ...chat.settings, topP: Number(event.target.value) } }))} /><small>{activeSettings.topP.toFixed(2)}</small></label></div><label className="field"><span>Max tokens</span><input className="number-input" type="number" min="64" max="4096" step="64" value={activeSettings.maxTokens} onChange={(event) => updateActiveChat((chat) => ({ ...chat, settings: { ...chat.settings, maxTokens: Number(event.target.value) } }))} /></label></div></section>
         <section className="panel settings-section"><div className="panel-label">Runtime</div><div className="runtime-grid"><div className="runtime-stat"><span>Status</span><strong>{runtime.loadedModelId === activeSettings.modelId ? "Ready" : "Needs load"}</strong></div><div className="runtime-stat"><span>Loaded model</span><strong>{runtime.loadedModelId ?? "None"}</strong></div><div className="runtime-stat"><span>Current chat</span><strong>{activeChat?.messages.length ?? 0} messages</strong></div><div className="runtime-stat"><span>Platform</span><strong>{runtime.platform}</strong></div></div></section>
-        <section className="panel settings-section"><div className="panel-label">Available models</div><div className="model-list">{models.map((model) => { const modelState = runtime.modelStates[model.id] ?? defaultModelState(model.sizeBytes); const isSelected = model.id === activeSettings.modelId; return <article key={model.id} className={`model-card${isSelected ? " selected" : ""}`}><button className="model-main" type="button" onClick={() => void handleSetChatModel(model.id)}><div className="model-topline"><span>{model.name}</span><span className={`status-pill ${modelState.status}`}>{modelState.status}</span></div><p>{model.description}</p><div className="model-label-row"><span className={`recommendation-chip${model.id === recommendedModelId ? " primary" : ""}`}>{getModelRecommendation(model.id, runtime.platform)}</span>{isSelected ? <span className="recommendation-chip">Current chat</span> : null}</div><div className="model-meta-row"><span>{getModelStorageLabel(modelState, model.sizeBytes)}</span><span>{Math.round(modelState.progress)}%</span></div><div className="model-meta-row"><span>{model.sizeHuman}</span><span>{modelState.localPath ? "Local GGUF" : modelState.status === "downloaded" || modelState.status === "ready" ? "Imported model" : "Remote only"}</span></div><div className="progress-track"><div className="progress-bar" style={{ width: `${modelState.progress}%` }} /></div>{modelState.error ? <div className="model-error">{modelState.error}</div> : null}</button><div className="model-actions">{(modelState.status === "remote" || modelState.status === "error") ? <button className="model-action-button" type="button" onClick={() => void handleDownload(model.id)}>Download</button> : null}{modelState.status === "downloading" ? <button className="model-action-button secondary" type="button" onClick={() => void cancelModelDownload(model.id).then(setRuntime)}>Cancel</button> : null}{(modelState.status === "downloaded" || modelState.status === "ready") ? <button className="model-action-button" type="button" onClick={() => void handleSelectModel(model.id)}>{getModelActionLabel(modelState.status, isSelected)}</button> : null}{(modelState.status === "downloaded" || modelState.status === "ready" || modelState.status === "error") ? <button className="model-action-button secondary" type="button" onClick={() => void deleteModel(model.id).then(setRuntime)}>Delete</button> : null}</div></article>; })}</div></section>
+        <section className="panel settings-section"><div className="panel-label">Available models</div><div className="model-list">{models.map((model) => { const modelState = runtime.modelStates[model.id] ?? defaultModelState(model.sizeBytes); const isSelected = model.id === activeSettings.modelId; return <article key={model.id} className={`model-card${isSelected ? " selected" : ""}`}><button className="model-main" type="button" onClick={() => void handleSelectModel(model.id)}><div className="model-topline"><span>{model.name}</span><span className={`status-pill ${modelState.status}`}>{modelState.status}</span></div><p>{model.description}</p><div className="model-label-row"><span className={`recommendation-chip${model.id === recommendedModelId ? " primary" : ""}`}>{getModelRecommendation(model.id, runtime.platform)}</span>{isSelected ? <span className="recommendation-chip">Shared</span> : null}</div><div className="model-meta-row"><span>{getModelStorageLabel(modelState, model.sizeBytes)}</span><span>{Math.round(modelState.progress)}%</span></div><div className="model-meta-row"><span>{model.sizeHuman}</span><span>{modelState.localPath ? "Local GGUF" : modelState.status === "downloaded" || modelState.status === "ready" ? "Imported model" : "Remote only"}</span></div><div className="progress-track"><div className="progress-bar" style={{ width: `${modelState.progress}%` }} /></div>{modelState.error ? <div className="model-error">{modelState.error}</div> : null}</button><div className="model-actions">{(modelState.status === "remote" || modelState.status === "error") ? <button className="model-action-button" type="button" onClick={() => void handleDownload(model.id)}>Download</button> : null}{modelState.status === "downloading" ? <button className="model-action-button secondary" type="button" onClick={() => void cancelModelDownload(model.id).then(setRuntime)}>Cancel</button> : null}{(modelState.status === "downloaded" || modelState.status === "ready") ? <button className="model-action-button" type="button" onClick={() => void handleSelectModel(model.id)}>{getModelActionLabel(modelState.status, isSelected)}</button> : null}{(modelState.status === "downloaded" || modelState.status === "ready" || modelState.status === "error") ? <button className="model-action-button secondary" type="button" onClick={() => void deleteModel(model.id).then(setRuntime)}>Delete</button> : null}</div></article>; })}</div></section>
       </aside>
     </div>
   );
